@@ -83,7 +83,9 @@ for t = 1:T
 Each wireless link is modeled using:
 ### Path Loss
 A log-distance path loss model:
+
 PL=PL0+10nlog10(d)+Lextra+Shadow
+
 where:
 - distance attenuation
 - environmental loss
@@ -94,7 +96,9 @@ are all considered.
 PRX=PTX−PL
 ### Noise
 Receiver noise is calculated using:
+
 N=−174+10log10(B)+NF
+
 where:
 - bandwidth
 - receiver noise figure
@@ -103,7 +107,9 @@ depend on the selected radio technology.
 SNR=PRX−Noise
 ### Channel Capacity
 The theoretical link capacity is computed using Shannon's theorem
+
 C=Blog2(1+SNR)
+
 The actual link rate is limited by the maximum PHY data rate of the selected radio.
 
 ```matlab
@@ -134,6 +140,7 @@ A link is considered valid only if:
 1. received power exceeds receiver sensitivity
 2. SNR is above the routing threshold
 Links below the threshold are removed from the routing graph.
+
 The simulator enumerates all feasible paths (up to a configurable hop limit) and evaluates every candidate route.
 
 ```matlab
@@ -271,11 +278,14 @@ end
 ## Radio Modes
 The simulator supports four PHY configurations.
 
-### Mode   Frequency   Typical Use
-LoRa	  915 MHz	  Long-range, low-rate tactical communication
-Wi-Fi   2.4 GHz   High throughput
-Bluetooth Mesh   2.4 GHz	  Low-power mesh
-Custom RF   User-defined   Research scenarios
+### Mode | Frequency | Typical Use
+LoRa | 915 MHz | Long-range, low-rate tactical communication
+
+Wi-Fi | 2.4 GHz | High throughput
+
+Bluetooth Mesh | 2.4 GHz | Low-power mesh
+
+Custom RF | User-defined | Research scenarios
 
 ```matlab
 function [B_Hz,f_Hz,Tx_dBm,NF_dB,rxSensitivity_dBm,phyDataRate_bps,perHopAirtime_s,dutyCycle] = ...
@@ -360,6 +370,7 @@ end
 
 ## SNR Threshold Analysis
 The simulator evaluates network performance for several routing thresholds.
+
 For each threshold it computes:
 - Mean PDR
 - Mean Throughput
