@@ -84,7 +84,7 @@ Each wireless link is modeled using:
 ### Path Loss
 A log-distance path loss model:
 
-PL=PL0+10nlog10(d)+Lextra+Shadow
+PL = PL<sub>0</sub> + 10n log<sub>10</sub>(d) + L<sub>extra</sub> + Shadow
 
 where:
 - distance attenuation
@@ -93,22 +93,22 @@ where:
 - fast fading
 are all considered.
 ### Received Power
-PRX=PTX−PL
+P<sub>RX</sub>=P<sub>TX</sub> −PL
 ### Noise
 Receiver noise is calculated using:
 
-N=−174+10log10(B)+NF
+N=−174+10n log<sub>10</sub>(B)+NF
 
 where:
 - bandwidth
 - receiver noise figure
 depend on the selected radio technology.
 ### Signal-to-Noise Ratio
-SNR=PRX−Noise
+SNR=P<sub>RX</sub>−Noise
 ### Channel Capacity
 The theoretical link capacity is computed using Shannon's theorem
 
-C=Blog2(1+SNR)
+C=B log<sub>2</sub>(1+SNR) 
 
 The actual link rate is limited by the maximum PHY data rate of the selected radio.
 
