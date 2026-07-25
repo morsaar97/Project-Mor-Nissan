@@ -28,7 +28,7 @@ The simulator models a network consisting of:
 N   = 50;   src = 1;   dst = N;
 areaW = 30;  areaH = 200;      % 30 x 200 m tactical corridor area
 % Mobility
-dt   = 0.5;  T  = 60;     % 1 ms step, total sim time = 30 s CHANGED
+dt   = 0.5;  T  = 60;    % 0.5-second step, total simulation time = 30 seconds
 vMin = 0.3;   vMax = 1.5;     % m/s
 ```
 
@@ -60,8 +60,8 @@ for t = 1:T
     failLog(t,:)  = false(1,N);
 
     %-- 3. Build radio graph and remove weak links ---------------------
-    [A_all, link_all] = buildLoRaRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB, ...
-    f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB);
+    [A_all, link_all] = buildRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB, ...
+    f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB,pathLossExponent);
 ......
     % Routing network
     A = double(currentValidA);
@@ -113,22 +113,28 @@ C=B log<sub>2</sub>(1+SNR)
 The actual link rate is limited by the maximum PHY data rate of the selected radio.
 
 ```matlab
-function rx_dBm = calcRxPowerLoRa(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB)
-% Log-distance path loss model. PL exponent 2.7 is an indoor/urban assumption.
-PL_exp=2.7; 
-PL0_dB=20*log10(4*pi*1/3e8*f_Hz); %reference path loss at 1 meter.
-fastFade =  0.8*randn;
-shadow = shadowStd_dB*randn; %shadowing component.Uses a normal random distribution.Simulates signal blocking by moving obstacles or buildings
-pl=PL0_dB+10*PL_exp*log10(d)+extraLoss_dB+shadow; %Total path loss calculation.Combines distance loss, extra static losses, and random fading.
-rx_dBm=Tx_dBm-pl+ fastFade; %final recived power.
+function rx_dBm = calcRxPower(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB,pathLossExponent)
+% Log-distance path-loss model.
+% pathLossExponent is defined by the selected environment.
+% Prevent log10(0) and keep the model referenced to 1 meter.
+d = max(d,1);
+PL0_dB = 20*log10(4*pi*f_Hz/3e8); %Free-space path loss at the reference path loss at 1 meter.
+fastFade_dB = 0.8*randn; % Small-scale fading.
+% Large-scale shadowing caused by buildings, terrain, vehicles, etc.
+shadow_dB = shadowStd_dB*randn;
+% Total path loss.
+pathLoss_dB=PL0_dB+10*pathLossExponent*log10(d)+extraLoss_dB+shadow_dB;
+% Received power.
+rx_dBm = Tx_dBm - pathLoss_dB + fastFade_dB;
 end
 
-function R = estimateLoRaRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB)
+function R = estimateRadioRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB,pathLossExponent)
 % Approximate max range using sensitivity and no random shadowing.
-PL_exp=2.7;
-PL0_dB=20*log10(4*pi*1/3e8*f_Hz);
-maxPL = Tx_dBm - rxSensitivity_dBm - extraLoss_dB;
-R = 10^((maxPL-PL0_dB)/(10*PL_exp));
+PL0_dB = 20*log10(4*pi*f_Hz/3e8); % Free-space path loss at 1 meter.
+% Maximum allowable propagation loss.
+maxPathLoss_dB = Tx_dBm - rxSensitivity_dBm -extraLoss_dB;
+% Solve the log-distance model for distance.
+R = 10^((maxPathLoss_dB - PL0_dB) / (10*pathLossExponent));
 end
 ```
 
@@ -183,7 +189,7 @@ The simulator enumerates all feasible paths (up to a configurable hop limit) and
 
     % evaluation radio range estimate based on sensitivity (no shadowing)
     % gives the maximum radius (R) around any given node (t)
-    R = estimateLoRaRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB);
+    R = estimateRadioRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB,pathLossExponent);
     rangeR_t(t) = R;
 ```
 
@@ -213,7 +219,7 @@ The route SNR is defined as the minimum SNR among all links on the selected path
 The route capacity is limited by the weakest link.
 
 ```matlab
-function [A,link] = buildLoRaRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB,f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB)
+function [A,link] = buildRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB,f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB,pathLossExponent)
 % Build graph using the selected radio link budget.
 % A link exists if received power is above the receiver sensitivity.
 N=size(pos,1);
@@ -237,7 +243,7 @@ for i = 1:N
         d = max(hypot(pos(i,1)-pos(j,1),pos(i,2)-pos(j,2)),0.1); %distance between Nodes i,j
 
         % One received-power realization per link and time step
-        rx = calcRxPowerLoRa(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB); %final received power
+        rx = calcRxPower(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB,pathLossExponent); %final received power
         %snr calculations in db and linear
         sdb  = rx - noise_dBm; 
         slin = 10^(sdb/10);
@@ -289,9 +295,8 @@ Custom RF | User-defined | Research scenarios
 
 ```matlab
 function [B_Hz,f_Hz,Tx_dBm,NF_dB,rxSensitivity_dBm,phyDataRate_bps,perHopAirtime_s,dutyCycle] = ...
-    configureRadioMode(radioMode,loraSF,loraBW_Hz,loraCR,loraPreamble,dutyCycle)
+    configureRadioMode(radioMode,loraSF,loraBW_Hz,loraCR,loraPreamble,dutyCycle,packet_B)
 % Configure the simulation according to the selected radio on the board.
-packet_B_default = 127;
 NF_dB = 6;
 switch radioMode
     case "LoRa"
@@ -309,14 +314,14 @@ switch radioMode
             error('Unsupported LoRa spreading factor');
     end
         phyDataRate_bps = loraBitrate(loraSF,loraBW_Hz,loraCR);
-        perHopAirtime_s = loraTimeOnAir(packet_B_default,loraSF,loraBW_Hz,loraCR,loraPreamble);
+        perHopAirtime_s = loraTimeOnAir(packet_B,loraSF,loraBW_Hz,loraCR,loraPreamble);
     case "WiFi"
         B_Hz = 20e6;
         f_Hz = 2.4e9;
         Tx_dBm = 18;
         rxSensitivity_dBm = -90;
         phyDataRate_bps = 150e6;
-        perHopAirtime_s = (packet_B_default*8)/phyDataRate_bps + 300e-6;
+        perHopAirtime_s = (packet_B*8)/phyDataRate_bps + 300e-6;
         dutyCycle = 1.0;
     case "BLEMesh"
         B_Hz = 2e6;
@@ -324,7 +329,7 @@ switch radioMode
         Tx_dBm = 8;
         rxSensitivity_dBm = -96;
         phyDataRate_bps = 1e6;
-        perHopAirtime_s = (packet_B_default*8)/phyDataRate_bps + 2e-3;
+        perHopAirtime_s = (packet_B*8)/phyDataRate_bps + 2e-3;
         dutyCycle = 1.0;
     case "Custom"
         B_Hz = 4e6;
@@ -332,7 +337,7 @@ switch radioMode
         Tx_dBm = 0;
         rxSensitivity_dBm = -105;
         phyDataRate_bps = 4e6;
-        perHopAirtime_s = (packet_B_default*8)/phyDataRate_bps + 0.5e-3;
+        perHopAirtime_s = (packet_B*8)/phyDataRate_bps + 0.5e-3;
         dutyCycle = 1.0;
     otherwise
         error('Unknown radioMode.');
@@ -384,7 +389,7 @@ This allows studying the trade-off between:
 - communication reliability
 
 ```matlab
- %% Test network performance for different SNR thresholds
+%% Test network performance for different SNR thresholds
 
 for s = 1:numThresholds
 
@@ -434,17 +439,9 @@ for s = 1:numThresholds
 
         if ~isempty(thresholdPaths)
 
-            thresholdResults = pathMetrics(...
-                thresholdPaths,...
-                link_threshold,...
-                B_Hz,...
-                macEff,...
-                packet_B,...
-                pos,...
-                perHopAirtime_s,...
-                dutyCycle,...
-                radioMode,...
-                loraSF);
+            thresholdResults = pathMetrics(thresholdPaths,...
+                link_threshold,B_Hz,macEff,packet_B,pos,...
+                perHopAirtime_s,dutyCycle,radioMode,loraSF,currentThreshold_dB);
 
             thresholdTable = thresholdResults.table;
 
@@ -468,6 +465,7 @@ for s = 1:numThresholds
         end
     end
 end
+
 ```
 
 ## Visualization
@@ -513,11 +511,12 @@ The simulator reports:
 - Route statistics
 
 ```matlab
-function results=pathMetrics(pc,link,B_Hz,macEff,pktB,pos,perHopAirtime_s,dutyCycle, radioMode,loraSF)
+function results = pathMetrics(pc,link,B_Hz,macEff,pktB,pos,...
+    perHopAirtime_s,dutyCycle,radioMode,loraSF,routingThreshold_dB)
 % Path metrics for the selected radio mode.
 % Throughput is based on bottleneck PHY capacity, duty cycle, MAC efficiency and route-level PDR.
-% PDR can be < 1 because every hop may loשלנאse packets due to weak SNR,
-% longer hop distance, multi-hop accumulation, and local contention.
+% PDR can be below 1 because each hop may lose packets due to
+% weak SNR, multi-hop accumulation, and local contention.
 np=numel(pc); c=3e8;
 rt=strings(np,1); hp=zeros(np,1);
 thr=zeros(np,1); lat=zeros(np,1);
@@ -558,20 +557,18 @@ for k=1:np
         % At 10 dB, packet success is approximately 67%.
         if radioMode == "LoRa"
 
-            switch loraSF
-                case 7
-                    snrMid_dB = -5.5;
-                case 10
-                    snrMid_dB = -8;
-                case 12
-                    snrMid_dB = -12;
-            end
+            % The 50% packet-success point is placed slightly above
+            % the routing threshold.
+            snrMid_dB = routingThreshold_dB + 1;
 
+            % Controls how quickly PDR rises with SNR.
+            snrSlope = 0.8;
+        else
+
+            % For Wi-Fi, BLE Mesh, and Custom radio modes.
+            snrMid_dB = routingThreshold_dB + 2;
             snrSlope = 0.5;
 
-        else
-            snrMid_dB = 8;
-            snrSlope = 0.35;
         end
         
         % PDR caused only by the physical SNR
@@ -595,6 +592,7 @@ for k=1:np
         sampleSNR(end+1,1)        = snrDB;
         sampleSNRonlyPDR(end+1,1) = hopSucc;
         sampleFinalPDR(end+1,1)   = hP(i);
+
     end
     bc=min(hC); bCap(k)=bc/1e6;
     bSNR(k)=min(hS);
@@ -605,9 +603,13 @@ for k=1:np
     pdr(k)=prod(hP);
 
     % Optional retransmission effect: lower PDR increases expected latency.
-    expectedRetries = 1/max(pdr(k),0.05);
-    lat(k)=sum(hL)*1e6*expectedRetries;
-    thr(k)=(dutyCycle*macEff*bc*pdr(k))/1e6;  % effective goodput includes duty cycle and delivery success
+    maxRetries = 3;
+    expectedAttempts = min(1 ./ max(hP,0.05),maxRetries + 1);
+    routeServiceTime_s = sum(hL .* expectedAttempts);
+    lat(k) = routeServiceTime_s * 1e6;
+    payloadBits = pktB * 8;
+    routeGoodput_bps = payloadBits/ routeServiceTime_s;
+    thr(k) = dutyCycle * macEff * routeGoodput_bps / 1e6; % effective goodput includes duty cycle and delivery success
     rt(k)=strjoin("N"+string(p),"->"); 
 end
 T2=table(rt,hp,thr,lat,bSNR,pdr,bCap,...
