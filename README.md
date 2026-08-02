@@ -396,10 +396,6 @@ Time histories of:
 - Latency
 - SNR
 - Packet Delivery Ratio
-### Figure 5- Performance vs SNR Threshold
-Illustrates how changing the routing threshold affects Throughput,PDR,Latency,Active links
-### Figure 6- Selected Route PDR vs Bottleneck SNR
-Shows the relationship between physical-layer signal quality and end-to-end packet delivery performance.
 
 ## Performance Metrics
 The simulator reports:
