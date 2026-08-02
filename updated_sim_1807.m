@@ -1,6 +1,5 @@
 function tactical_mesh_sim_selected_metrics()
 % =========================================================================
-%  ESP32-S3FN8 + SX1262 Multi-Mode 100-Node Mobile Mesh Simulation
 %  Area: 30 m x 200 m | Custom tactical RF / LoRa / Wi-Fi / BLE selectable PHY model
 %
 %  VISUALIZATIONS:
@@ -8,7 +7,7 @@ function tactical_mesh_sim_selected_metrics()
 %              * Edge colors = SNR quality (red->yellow->green)
 %              * Node trails showing recent movement
 %              * Best throughput route highlighted in gold
-%              * Weak links with SNR < 10 dB are excluded from routing
+%              * Weak links with SNR < 10 dB (changable) are excluded from routing
 %              * SNR colorbar
 %   Fig 2  - Live 4-panel dashboard (updates every step):
 %              * Mean & best throughput vs time
@@ -16,23 +15,33 @@ function tactical_mesh_sim_selected_metrics()
 %              * Active SNR-valid connections area chart
 %              * SNR + radio range dual-axis
 %   Fig 3  - 10-frame topology montage (post-run)
-%   Fig 4  - 6-panel time-series metric plots (post-run)
+%   Fig 4  - 4-panel time-series metric plots (post-run)
 %
 %  Mobility:   Random Waypoint
-%  Link rule:  Links with SNR < 10 dB are excluded from the routing graph
+%  Link rule:  Links with SNR < 10 (changeable) dB are excluded from the routing graph
 %  PHY:        selectable LoRa / Wi-Fi / BLE Mesh model. LoRa uses SF, duty cycle and Time-on-Air.
+%
+%  CHANGE LOG (duty-cycle fix):
+%   Previously `dutyCycle` was threaded through configureRadioMode() but every
+%   mode branch reassigned it to 1.0, so the regulatory/MAC duty-cycle limit
+%   never actually constrained throughput for any mode, including LoRa. This
+%   version adds explicit, mode-specific duty-cycle limits (configurable
+%   below) and actually applies the LoRa regulatory duty cycle. Wi-Fi and BLE
+%   Mesh are not duty-cycle-regulated the same way LoRa/ISM sub-bands are, so
+%   their limits default to 1.0 with contention handled instead via macEff /
+%   nodeDegree penalties -- see notes at each parameter.
 % =========================================================================
 clc; close all;
 rng(42);
 
 %% ==================== CONFIGURABLE PARAMETERS ==========================
-N   = 50;   src = 1;   dst = N;
+N   = 30;   src = 1;   dst = N;
 
 areaW = 30;  areaH = 200;      % 30 x 200 m tactical corridor area
 
 % Mobility
-dt   = 0.5;  T  = 60;     % 1 ms step, total sim time = 30 s CHANGED
-vMin = 0.3;   vMax = 1.5;     % m/s
+dt   = 0.5;  T  = 60;     % 0.5-second step, total simulation time = 30 seconds
+vMin = 0.5;   vMax = 2;     % m/s
 
 % Hardware / PHY mode selection: ESP32-S3FN8 + SX1262 board
 % Supported board radios:
@@ -42,11 +51,22 @@ vMin = 0.3;   vMax = 1.5;     % m/s
 radioMode = "LoRa";          % choose: "Custom" , "LoRa", "WiFi", or "BLEMesh"
 
 % LoRa scenario parameters. These are used only when radioMode = "LoRa".
-loraSF = 10;                   % choose 7, 10, or 12 to show range/latency tradeoff
+loraSF = 7;                   % choose 7, 10, or 12 to show range/latency tradeoff
 loraBW_Hz = 125e3;            % common LoRa bandwidth: 125 kHz
 loraCR = 1;                   % coding rate index: 1 means 4/5
 loraPreamble = 8;             % LoRa preamble symbols
-dutyCycle = 0.01;             % 1% duty-cycle limitation, important for LoRa
+
+% ---- Regulatory / MAC duty-cycle limits (fraction of airtime a node may transmit) ----
+% LoRa on ISM sub-bands (e.g. EU868) is frequently duty-cycle-limited by
+% regulation, independent of Time-on-Air. Typical EU868 sub-band limits are
+% 1% (g1) or 10% (g1-g3, LBT/AFA exempt bands) -- pick per your regulatory
+% region / band plan. FCC 915 MHz operation instead uses dwell-time + hop
+% rules rather than a duty-cycle percentage; treat loraDutyCycleLimit as an
+% effective cap either way.
+loraDutyCycleLimit   = 1.0;  % 
+wifiDutyCycleLimit   = 1.0;   % no regulatory duty-cycle limit; contention handled via macEff instead
+bleDutyCycleLimit    = 1.0;   % no regulatory duty-cycle limit; advertising duty cycle not modeled here
+customDutyCycleLimit = 1.0;   % user-configurable radio: set your own limit here
 
 snrFailThreshold_dB = 10;
 
@@ -54,44 +74,69 @@ if radioMode == "LoRa"
 
     switch loraSF
         case 7
-            snrFailThreshold_dB = -7.5;
+            snrFailThreshold_dB = snrFailThreshold_dB-14; %-7.5
         case 10
-            snrFailThreshold_dB = -15;
+            snrFailThreshold_dB = snrFailThreshold_dB-22.5; %-15
         case 12
-            snrFailThreshold_dB = -20;
+            snrFailThreshold_dB = snrFailThreshold_dB-27.5; %-20
         otherwise
             error('Unsupported LoRa spreading factor');
     end
 end
 
-% Configure radio parameters according to selected mode
-[B_Hz,f_Hz,Tx_dBm,NF_dB,rxSensitivity_dBm,phyDataRate_bps,perHopAirtime_s,dutyCycle] = ...
-    configureRadioMode(radioMode,loraSF,loraBW_Hz,loraCR,loraPreamble,dutyCycle);
-
-% Scenario control
-% "NORMAL": chip-spec 20x20m network, usually very strong SNR.
-% "SNR_FAILURE_DEMO": adds obstacle/body/urban loss so some nodes fail
-% only when their strongest SNR is below 10 dB.
-scenario = "NORMAL";
-switch scenario
-    case "NORMAL"
-        extraLoss_dB = 5;
-        shadowStd_dB = 4;
-    case "SNR_FAILURE_DEMO"
-        extraLoss_dB = 40;      
-        shadowStd_dB = 8;
-    otherwise
-        extraLoss_dB = 0;
-        shadowStd_dB = 4;
+% LoRa throughput is typically well under 1 Mbps, so the live dashboard and
+% post-run time-series throughput panels display it in kbps for readability;
+% every other figure/table/fprintf keeps Mbps as the canonical unit.
+if radioMode == "LoRa"
+    thrScale = 1000;
+    thrUnit  = 'kbps';
+else
+    thrScale = 1;
+    thrUnit  = 'Mbps';
 end
+
+thresholdLabel = sprintf('%.1f dB threshold',snrFailThreshold_dB);
 
 % MAC
 packet_B = 127; % bytes
 macEff   = 0.70; % MAC efficiency / duty-cycle / overhead factor
 
+% Configure radio parameters according to selected mode
+[B_Hz,f_Hz,Tx_dBm,NF_dB,rxSensitivity_dBm,phyDataRate_bps,perHopAirtime_s,dutyCycle] = ...
+    configureRadioMode(radioMode,loraSF,loraBW_Hz,loraCR,loraPreamble,packet_B, ...
+    loraDutyCycleLimit,wifiDutyCycleLimit,bleDutyCycleLimit,customDutyCycleLimit);
+
+% Scenario control
+% "NORMAL": chip-spec 20x20m network, usually very strong SNR.
+% "SNR_FAILURE_DEMO": adds obstacle/body/urban loss so some nodes fail
+% only when their strongest SNR is below 10 dB (changable).
+% for pathLossExponent: 2.0–2.5: open outdoor environment, 
+% 2.5–3.0: suburban or partly obstructed,
+% 3.0–4.0: urban, indoor, or heavily obstructed.
+scenario = "NORMAL";
+
+switch scenario
+
+    case "NORMAL"
+        extraLoss_dB = 15;
+        shadowStd_dB = 4;
+        pathLossExponent = 3.2; 
+
+    case "SNR_FAILURE_DEMO"
+        extraLoss_dB = 10;
+        shadowStd_dB = 4;
+        pathLossExponent = 4; 
+
+    otherwise
+        extraLoss_dB = 0;
+        shadowStd_dB = 4;
+        pathLossExponent = 2.7; 
+end
+
+
 % Path search restrictions
 maxEnumPaths = 100;
-maxHops      = 5;
+maxHops      = 7;
 
 % Trail length for animated topology
 trailLen = 6;
@@ -100,6 +145,7 @@ trailLen = 6;
 numSnapshots = 10;
 snapSteps    = round(linspace(1, T, numSnapshots));
 plotEvery = 1;
+
 
 %% ==================== INITIALISE =======================================
 pos   = [areaW*rand(N,1), areaH*rand(N,1)];
@@ -137,11 +183,6 @@ selectedSNR = nan(T,1);
 % Collected across all steps for histograms/CDF
 allHops = [];  allPDR = [];
 
-% Store SNR-PDR samples for post-analysis
-allLinkSNR = [];
-allSNRonlyHopPDR = [];
-allFinalHopPDR   = [];
-
 % Failure log  T x N
 failLog = false(T,N);
 
@@ -155,22 +196,6 @@ fallenRxPower  = [];
 
 previousValidA = false(N);
 
-%% SNR-threshold sensitivity analysis
-
-thresholdVec = 0:5:20;             % Tested SNR thresholds [dB]
-numThresholds = numel(thresholdVec);
-
-% Selected-route metrics for every time step and threshold
-thresholdSelectedPDR = nan(T,numThresholds);
-thresholdSelectedThr = nan(T,numThresholds);
-thresholdSelectedLat = nan(T,numThresholds);
-
-% Number of links that remain after applying each threshold
-thresholdActiveLinks = zeros(T,numThresholds);
-
-% Whether a route from SRC to DST exists
-thresholdRouteExists = false(T,numThresholds);
-
 fprintf("=== Multi-Mode Mesh Simulation ===\n");
 fprintf("Area: %.0fm x %.0fm | N=%d | Steps=%d | dt=%.4fs\n",areaW,areaH,N,T,dt);
 fprintf("Mode=%s | BW=%.2f MHz | f=%.0f MHz | Tx=%.0f dBm | NF=%.0f dB\n",radioMode,B_Hz/1e6,f_Hz/1e6,Tx_dBm,NF_dB);
@@ -182,16 +207,17 @@ fprintf("Scenario=%s | extraLoss=%.1f dB | shadowStd=%.1f dB\n",scenario,extraLo
 fprintf("SNR failure threshold = %.1f dB\n",snrFailThreshold_dB);
 fprintf("\n");
 
+
 %% ==================== FIGURE WINDOWS ===================================
 % Use fixed positive figure numbers instead of figure handles.
 % This avoids "Argument must be a Figure object or a positive integer"
 % errors if a live figure is closed/recreated during the animation.
 figure(1);
-set(gcf,'Name','LoRa Mesh Live Topology','NumberTitle','off',...
+set(gcf,'Name',sprintf('%s Mesh Live Topology',radioMode),'NumberTitle','off',...
     'Position',[10 430 700 580],'Color',[0.08 0.08 0.12]);
 
 figure(2);
-set(gcf,'Name','LoRa Mesh Live Dashboard','NumberTitle','off',...
+set(gcf,'Name',sprintf('%s Mesh Live Dashboard',radioMode),'NumberTitle','off',...
     'Position',[720 430 680 560],'Color',[0.08 0.08 0.12]);
 
 %% ==================== MAIN SIMULATION LOOP =============================
@@ -213,94 +239,9 @@ for t = 1:T
     failLog(t,:)  = false(1,N);
 
     %-- 3. Build radio graph and remove weak links ---------------------
-    [A_all, link_all] = buildLoRaRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB, ...
-    f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB);
+    [A_all, link_all] = buildRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB, ...
+    f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB,pathLossExponent);
     
-    %% Test network performance for different SNR thresholds
-
-for s = 1:numThresholds
-
-    currentThreshold_dB = thresholdVec(s);
-
-    % Keep only physical links whose SNR meets this threshold
-    A_threshold = A_all & ...
-        (link_all.snr_dB >= currentThreshold_dB);
-
-    % Make sure the adjacency matrix is symmetric
-    A_threshold = double(A_threshold & A_threshold');
-
-    % Count unique active links
-    thresholdActiveLinks(t,s) = ...
-        nnz(triu(A_threshold));
-
-    % Create link structure for this threshold
-    link_threshold = link_all;
-    link_threshold.A = A_threshold;
-
-    % Remove the metrics of excluded links
-    excludedLinks = (A_threshold == 0);
-
-    link_threshold.snr_dB(excludedLinks)  = NaN;
-    link_threshold.snrLin(excludedLinks)  = NaN;
-    link_threshold.cap_bps(excludedLinks) = NaN;
-    link_threshold.rx_dBm(excludedLinks)  = NaN;
-
-    % Create graph for this threshold
-    G_threshold = graph(A_threshold);
-
-    % Check whether SRC and DST are connected
-    componentID = conncomp(G_threshold);
-
-    thresholdReachable = ...
-        (componentID(src) == componentID(dst));
-
-    if thresholdReachable
-
-        % Find candidate routes
-        thresholdPaths = allSimplePaths(...
-            A_threshold,...
-            src,...
-            dst,...
-            maxHops,...
-            maxEnumPaths);
-
-        if ~isempty(thresholdPaths)
-
-            thresholdResults = pathMetrics(...
-                thresholdPaths,...
-                link_threshold,...
-                B_Hz,...
-                macEff,...
-                packet_B,...
-                pos,...
-                perHopAirtime_s,...
-                dutyCycle,...
-                radioMode,...
-                loraSF);
-
-            thresholdTable = thresholdResults.table;
-
-            % Select the route with maximum throughput
-            [~,thresholdRouteIndex] = ...
-                max(thresholdTable.Throughput_Mbps);
-
-            % Store the selected-route metrics
-            thresholdSelectedPDR(t,s) = ...
-                thresholdTable.PDR(thresholdRouteIndex);
-
-            thresholdSelectedThr(t,s) = ...
-                thresholdTable.Throughput_Mbps(...
-                thresholdRouteIndex);
-
-            thresholdSelectedLat(t,s) = ...
-                thresholdTable.Latency_us(...
-                thresholdRouteIndex);
-
-            thresholdRouteExists(t,s) = true;
-        end
-    end
-end
-
     % Links allowed for routing
     currentValidA = A_all & (link_all.snr_dB >= snrFailThreshold_dB);
 
@@ -341,7 +282,7 @@ end
 
     % evaluation radio range estimate based on sensitivity (no shadowing)
     % gives the maximum radius (R) around any given node (t)
-    R = estimateLoRaRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB);
+    R = estimateRadioRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB,pathLossExponent);
     rangeR_t(t) = R;
 
     %-- 5. Snapshot capture ------------------------------------------
@@ -364,13 +305,9 @@ end
         numPaths_t(t) = numel(paths);
 
         if ~isempty(paths)
-            results = pathMetrics(paths,link,B_Hz,macEff,packet_B,pos,perHopAirtime_s,dutyCycle,radioMode,loraSF);
-            Ttbl    = results.table;
-            
-            % Save per-hop SNR and PDR samples for post-run analysis
-            allLinkSNR = [allLinkSNR; results.linkSNR];
-            allSNRonlyHopPDR = [allSNRonlyHopPDR;results.snrOnlyHopPDR];
-            allFinalHopPDR = [allFinalHopPDR;results.finalHopPDR];
+            results = pathMetrics(paths,link,B_Hz,macEff,packet_B,pos,...
+                perHopAirtime_s,dutyCycle,radioMode,loraSF,snrFailThreshold_dB);
+            Ttbl   = results.table;
     
             % Mean values over all available routes
             meanThr(t) = mean(Ttbl.Throughput_Mbps);
@@ -379,7 +316,27 @@ end
             meanPDR(t) = mean(Ttbl.PDR);
 
             % Best routes according to each metric
-            [bestVal(t,1),iThr] = max(Ttbl.Throughput_Mbps);
+            % ============================================================
+            % Select route by maximum throughput.
+            % If several routes have nearly the same throughput,
+            % choose the one with the minimum latency.
+            % ============================================================
+            % Maximum throughput among all candidate routes
+            maxThr = max(Ttbl.Throughput_Mbps);
+            % Allowed throughput difference from the maximum.
+            % 0.005 means routes within 0.5% of the maximum throughput.
+            throughputTolerance = 0.005;
+            % Find routes whose throughput is practically equal to the maximum
+            candidateIdx = find(Ttbl.Throughput_Mbps >= (1-throughputTolerance) * maxThr);
+            % Among those routes, choose the route with minimum latency
+            [~,localIdx] = min(Ttbl.Latency_us(candidateIdx));
+            % Convert the local candidate index back to the table index
+            iThr = candidateIdx(localIdx);
+
+            % Store the throughput of the route that was actually selected
+            bestVal(t,1) = Ttbl.Throughput_Mbps(iThr);
+
+            % Best routes according to the other metrics
             [bestVal(t,2),iLat] = min(Ttbl.Latency_us);
             [bestVal(t,3),iSNR] = max(Ttbl.BottleneckSNR_dB);
             [bestVal(t,4),iPDR] = max(Ttbl.PDR);
@@ -416,10 +373,8 @@ if mod(t,plotEvery)==0 || t==1 || t==T
     %================================================================
     figure(1);
     clf(gcf);
-    set(gcf,'Name','LoRa Mesh Live Topology',...
-        'NumberTitle','off',...
-        'Position',[10 430 700 580],...
-        'Color',[0.08 0.08 0.12]);
+    set(gcf,'Name',sprintf('%s Mesh Live Topology',radioMode),...
+        'NumberTitle','off','Position',[10 430 700 580],'Color',[0.08 0.08 0.12]);
     ax1 = axes('Parent',gcf,'Color',[0.08 0.08 0.12],...
         'XColor','w','YColor','w');
     hold(ax1,'on');
@@ -432,7 +387,6 @@ if mod(t,plotEvery)==0 || t==1 || t==T
         ok = ~isnan(tx);
         if sum(ok)<2, continue; end
         tx=tx(ok); ty=ty(ok);
-        alphas = linspace(0.04, 0.30, numel(tx));
         for seg=1:numel(tx)-1
             plot(ax1,tx(seg:seg+1),ty(seg:seg+1),'-',...
                 'Color',[0.35 0.75 1.0],'LineWidth',0.9);
@@ -447,7 +401,10 @@ if mod(t,plotEvery)==0 || t==1 || t==T
             continue; 
         end
         
-        tc = max(0,min(1,(link.snr_dB(u,v)-5)/20));
+        snrColorMin = snrFailThreshold_dB;
+        snrColorMax = snrFailThreshold_dB + 15;
+        tc=(link.snr_dB(u,v)-snrColorMin)/(snrColorMax-snrColorMin);
+        tc = max(0,min(1,tc));
         eCol = [(1-tc), tc*0.85, tc*0.25];
         plot(ax1,[pos(u,1) pos(v,1)],[pos(u,2) pos(v,2)],'-',...
             'Color',eCol,'LineWidth',0.85);
@@ -523,10 +480,8 @@ if mod(t,plotEvery)==0 || t==1 || t==T
     %================================================================
     figure(2);
     clf(gcf);
-    set(gcf,'Name','LoRa Mesh Live Dashboard',...
-        'NumberTitle','off',...
-        'Position',[720 430 680 560],...
-        'Color',[0.08 0.08 0.12]);
+    set(gcf,'Name',sprintf('%s Mesh Live Dashboard',radioMode),...
+        'NumberTitle','off','Position',[720 430 680 560],'Color',[0.08 0.08 0.12]);
     tV = (1:t)*dt;
 
     axD = @(r,c) subplot(2,2,(r-1)*2+c,'Parent',gcf);
@@ -536,12 +491,12 @@ if mod(t,plotEvery)==0 || t==1 || t==T
     set(axA,'Color',[0.12 0.12 0.18],'XColor','w','YColor','w',...
         'GridColor',[0.3 0.3 0.3],'GridAlpha',0.5);
     hold(axA,'on'); grid(axA,'on');
-    plot(axA,tV,meanThr(1:t),'Color',[0.2 0.8 1.0],'LineWidth',1.4,'DisplayName','Mean Network');
-    plot(axA,tV,selectedThr(1:t),'c-','LineWidth',2.2,'DisplayName','Selected Route');
-    plot(axA,tV,bestVal(1:t,1),'y--','LineWidth',1.2,'DisplayName','Best Possible');
+    plot(axA,tV,thrScale*meanThr(1:t),'Color',[0.2 0.8 1.0],'LineWidth',1.4,'DisplayName','Mean Network');
+    plot(axA,tV,thrScale*selectedThr(1:t),'c-','LineWidth',2.2,'DisplayName','Selected Route');
+    plot(axA,tV,thrScale*bestVal(1:t,1),'y--','LineWidth',1.2,'DisplayName','Best Possible');
     legend(axA,'TextColor','w','Color',[0.15 0.15 0.2],'FontSize',7,'Location','northwest');
-    ylabel(axA,'Mbps','Color','w');
-    title(axA,'Throughput (Mbps)','Color','w','FontWeight','bold');
+    ylabel(axA,thrUnit,'Color','w');
+    title(axA,['Throughput (' thrUnit ')'],'Color','w','FontWeight','bold');
     xlim(axA,[0 T*dt]);
 
     % Panel B: PDR
@@ -581,7 +536,7 @@ if mod(t,plotEvery)==0 || t==1 || t==T
     hold(axD2,'on'); grid(axD2,'on');
     plot(axD2,tV,selectedSNR(1:t),'c-','LineWidth',2.2);
     yline(axD2,snrFailThreshold_dB,'--','Color',[1 0.6 0],...
-        'LineWidth',1.2,'Label','10 dB threshold');
+    'LineWidth',1.2,'Label',thresholdLabel);
     ylabel(axD2,'Bottleneck SNR (dB)','Color','w');
     xlabel(axD2,'Time (s)','Color','w');
     title(axD2,'Selected Route Bottleneck SNR','Color','w','FontWeight','bold');
@@ -595,204 +550,6 @@ if mod(t,plotEvery)==0 || t==1 || t==T
     drawnow;
 end 
 end % main loop
-
-%% ===========================================================
-%% Threshold sensitivity analysis
-%% ===========================================================
-
-meanPDRvsThreshold = ...
-    mean(thresholdSelectedPDR,1,'omitnan');
-
-meanThrVsThreshold = ...
-    mean(thresholdSelectedThr,1,'omitnan');
-
-meanLatVsThreshold = ...
-    mean(thresholdSelectedLat,1,'omitnan');
-
-meanLinksVsThreshold = ...
-    mean(thresholdActiveLinks,1,'omitnan');
-
-routeAvailabilityPercent = ...
-    100*sum(thresholdRouteExists,1)/T;
-
-%% FIGURE: Network performance versus SNR routing threshold
-
-figure(...
-    'Name','Performance versus SNR Threshold',...
-    'NumberTitle','off',...
-    'Position',[100 80 1100 720],...
-    'Color',[0.08 0.08 0.12]);
-
-tlThreshold = tiledlayout(...
-    2,2,...
-    'Padding','compact',...
-    'TileSpacing','compact');
-
-% ---------------------------------------------------------------
-% 1. Selected-route PDR versus threshold
-% ---------------------------------------------------------------
-ax1 = nexttile(tlThreshold);
-
-set(ax1,...
-    'Color',[0.12 0.12 0.18],...
-    'XColor','w',...
-    'YColor','w');
-
-hold(ax1,'on');
-grid(ax1,'on');
-
-plot(ax1,...
-    thresholdVec,...
-    meanPDRvsThreshold,...
-    'o-',...
-    'LineWidth',2,...
-    'MarkerSize',6);
-
-xline(ax1,...
-    snrFailThreshold_dB,...
-    '--',...
-    'Current threshold',...
-    'LineWidth',1.3);
-
-xlabel(ax1,'SNR Threshold (dB)');
-ylabel(ax1,'Mean Selected-Route PDR');
-
-title(ax1,...
-    'PDR vs SNR Threshold',...
-    'Color','w',...
-    'FontWeight','bold');
-
-ylim(ax1,[0 1.02]);
-
-
-% ---------------------------------------------------------------
-% 2. Selected-route throughput versus threshold
-% ---------------------------------------------------------------
-ax2 = nexttile(tlThreshold);
-
-set(ax2,...
-    'Color',[0.12 0.12 0.18],...
-    'XColor','w',...
-    'YColor','w');
-
-hold(ax2,'on');
-grid(ax2,'on');
-
-plot(ax2,...
-    thresholdVec,...
-    meanThrVsThreshold,...
-    'o-',...
-    'LineWidth',2,...
-    'MarkerSize',6);
-
-xline(ax2,...
-    snrFailThreshold_dB,...
-    '--',...
-    'Current threshold',...
-    'LineWidth',1.3);
-
-xlabel(ax2,'SNR Threshold (dB)');
-ylabel(ax2,'Mean Selected Throughput (Mbps)');
-
-title(ax2,...
-    'Throughput vs SNR Threshold',...
-    'Color','w',...
-    'FontWeight','bold');
-
-
-% ---------------------------------------------------------------
-% 3. Selected-route latency versus threshold
-% ---------------------------------------------------------------
-ax3 = nexttile(tlThreshold);
-
-set(ax3,...
-    'Color',[0.12 0.12 0.18],...
-    'XColor','w',...
-    'YColor','w');
-
-hold(ax3,'on');
-grid(ax3,'on');
-
-plot(ax3,...
-    thresholdVec,...
-    meanLatVsThreshold,...
-    'o-',...
-    'LineWidth',2,...
-    'MarkerSize',6);
-
-xline(ax3,...
-    snrFailThreshold_dB,...
-    '--',...
-    'Current threshold',...
-    'LineWidth',1.3);
-
-xlabel(ax3,'SNR Threshold (dB)');
-ylabel(ax3,'Mean Selected Latency (\mus)');
-
-title(ax3,...
-    'Latency vs SNR Threshold',...
-    'Color','w',...
-    'FontWeight','bold');
-
-
-% ---------------------------------------------------------------
-% 4. Active links versus threshold
-% ---------------------------------------------------------------
-ax4 = nexttile(tlThreshold);
-
-set(ax4,...
-    'Color',[0.12 0.12 0.18],...
-    'XColor','w',...
-    'YColor','w');
-
-hold(ax4,'on');
-grid(ax4,'on');
-
-plot(ax4,...
-    thresholdVec,...
-    meanLinksVsThreshold,...
-    'o-',...
-    'LineWidth',2,...
-    'MarkerSize',6);
-
-xline(ax4,...
-    snrFailThreshold_dB,...
-    '--',...
-    'Current threshold',...
-    'LineWidth',1.3);
-
-xlabel(ax4,'SNR Threshold (dB)');
-ylabel(ax4,'Mean Number of Active Links');
-
-title(ax4,...
-    'Active Links vs SNR Threshold',...
-    'Color','w',...
-    'FontWeight','bold');
-
-sgtitle(tlThreshold,...
-    'SNR Routing-Threshold Sensitivity Analysis',...
-    'Color','w',...
-    'FontSize',13,...
-    'FontWeight','bold');
-
-thresholdResultsTable = table(...
-    thresholdVec',...
-    meanPDRvsThreshold',...
-    meanThrVsThreshold',...
-    meanLatVsThreshold',...
-    meanLinksVsThreshold',...
-    routeAvailabilityPercent',...
-    'VariableNames',{...
-        'SNR_Threshold_dB',...
-        'Mean_Selected_PDR',...
-        'Mean_Selected_Throughput_Mbps',...
-        'Mean_Selected_Latency_us',...
-        'Mean_Active_Links',...
-        'Route_Availability_Percent'});
-
-disp(' ');
-disp('SNR threshold sensitivity results:');
-disp(thresholdResultsTable);
 
 %% =========================================================================
 %%  POST-RUN FIGURES
@@ -840,7 +597,10 @@ for k = 1:numSnapshots
     [eki,ekj]=find(triu(A_k));
     for e=1:numel(eki)
         u=eki(e); v=ekj(e);
-        tc=max(0,min(1,(link_k.snr_dB(u,v)-5)/20));
+        snrColorMin = snrFailThreshold_dB;
+        snrColorMax = snrFailThreshold_dB + 15;
+        tc = (link_k.snr_dB(u,v)-snrColorMin)/(snrColorMax-snrColorMin);
+        tc = max(0,min(1,tc));
         eCol=[(1-tc) tc*0.85 tc*0.25];
         plot(axM,[pos_k(u,1) pos_k(v,1)],[pos_k(u,2) pos_k(v,2)],'-',...
             'Color',eCol,'LineWidth',0.7);
@@ -871,7 +631,7 @@ sgtitle(tl3,'RF Mesh Topology Snapshots  (green=SRC, magenta=DST, weak links exc
     'Color','w','FontSize',11,'FontWeight','bold');
 
 %----------------------------------------------------------------
-%  FIG 4 — 6-panel time-series metrics
+%  FIG 4 — 4-panel time-series metrics
 %----------------------------------------------------------------
 figure('Name','Mesh Metrics Over Time','NumberTitle','off',...
     'Position',[10 40 1100 720],'Color',[0.08 0.08 0.12]);
@@ -881,12 +641,12 @@ darkAx = @(ax) set(ax,'Color',[0.12 0.12 0.18],'XColor','w','YColor','w',...
     'GridColor',[0.3 0.3 0.3],'GridAlpha',0.5);
 
 ax=nexttile(tl4); darkAx(ax); hold(ax,'on'); grid(ax,'on');
-plot(ax,tVec,meanThr,'Color',[0.2 0.8 1.0],'LineWidth',1.4);
-plot(ax,tVec,selectedThr,'c-','LineWidth',2.3);
-plot(ax,tVec,bestVal(:,1),'y--','LineWidth',1.2);
+plot(ax,tVec,thrScale*meanThr,'Color',[0.2 0.8 1.0],'LineWidth',1.4);
+plot(ax,tVec,thrScale*selectedThr,'c-','LineWidth',2.3);
+plot(ax,tVec,thrScale*bestVal(:,1),'y--','LineWidth',1.2);
 legend(ax,{'Mean Network','Selected Route','Best Possible'},'TextColor','w','Color',[0.15 0.15 0.2],'FontSize',8,'Location','northwest');
-ylabel(ax,'Mbps','Color','w'); xlabel(ax,'Time (s)','Color','w');
-title(ax,'Throughput (Mbps)','Color','w','FontWeight','bold'); xlim(ax,[0 T*dt]);
+ylabel(ax,thrUnit,'Color','w'); xlabel(ax,'Time (s)','Color','w');
+title(ax,['Throughput (' thrUnit ')'],'Color','w','FontWeight','bold'); xlim(ax,[0 T*dt]);
 
 ax=nexttile(tl4); darkAx(ax); hold(ax,'on'); grid(ax,'on');
 plot(ax,tVec,meanLat,'r-','LineWidth',1.4);
@@ -900,8 +660,8 @@ ax=nexttile(tl4); darkAx(ax); hold(ax,'on'); grid(ax,'on');
 plot(ax,tVec,meanSNR,'m-','LineWidth',1.5);
 plot(ax,tVec,selectedSNR,'c-','LineWidth',2.5);
 plot(ax,tVec,bestVal(:,3),'y--','LineWidth',1.2);
-yline(ax,10,'--','Color',[1 0.6 0],'LineWidth',1.2,'Label','10 dB');
-legend(ax,{'Mean Network SNR','Selected Route SNR','Best Possible SNR'},'TextColor','w','Color',[0.15 0.15 0.2],'FontSize',8,'Location','northwest');
+yline(ax,snrFailThreshold_dB,'--','Color',[1 0.6 0],'LineWidth',1.2,'Label',thresholdLabel);
+legend(ax,{'Mean Network SNR','Selected Route SNR','Best Candidate-Route SNR'},'TextColor','w','Color',[0.15 0.15 0.2],'FontSize',8,'Location','northwest');
 ylabel(ax,'dB','Color','w'); xlabel(ax,'Time (s)','Color','w');
 title(ax,'Bottleneck SNR (dB)','Color','w','FontWeight','bold'); xlim(ax,[0 T*dt]);
 
@@ -919,22 +679,6 @@ ylim(ax,[0 1.05]); xlim(ax,[0 T*dt]);
 sgtitle(tl4,sprintf('RF %d-Node: Performance Metrics Over Time',N),...
     'Color','w','FontSize',12,'FontWeight','bold');
 
-%% Selected-route PDR versus bottleneck SNR
-
-validSelected = ~isnan(selectedSNR) & ~isnan(selectedPDR);
-figure('Name','Selected Route PDR versus SNR','NumberTitle','off');
-scatter(selectedSNR(validSelected),selectedPDR(validSelected),45,...
-    tVec(validSelected),'filled');
-hold on;
-xline(snrFailThreshold_dB,'r--','10 dB routing threshold','LineWidth',1.5);
-
-grid on;
-xlabel('Selected Route Bottleneck SNR (dB)');
-ylabel('Selected Route End-to-End PDR');
-title('Selected Route PDR versus Bottleneck SNR');
-ylim([0 1.02]);
-cb = colorbar;
-cb.Label.String = 'Simulation Time (s)';
 
 %% ==================== SUMMARY REPORT ===================================
 fprintf("\n==========================================\n");
@@ -951,6 +695,7 @@ fprintf("Mean selected SNR:          %.2f dB\n",mean(selectedSNR,'omitnan'));
 fprintf("Mean network PDR:           %.4f\n",mean(meanPDR,'omitnan'));
 fprintf("Mean selected PDR:          %.4f\n",mean(selectedPDR,'omitnan'));
 fprintf("Mean radio range:   %.2f m\n",mean(rangeR_t,'omitnan'));
+fprintf("Applied duty cycle:  %.2f%%\n",100*dutyCycle);
 
 fprintf("\n--- Best routes (last valid step) ---\n");
 lastT = find(~isnan(bestVal(:,1)),1,'last');
@@ -961,11 +706,68 @@ if ~isempty(lastT)
     fprintf("Best PDR:        %s\n  -> %.4f\n",bestRouteStr(lastT,4),bestVal(lastT,4));
 end
 fprintf("\n--- PDR<1 scenario explanation ---\n");
-fprintf("PDR can drop below 1 when links are near the 10 dB SNR threshold, when routes use many hops, or when nodes have many neighbors causing contention.\n");
+fprintf(['PDR can drop below 1 when links are near the %.1f dB ','SNR threshold, when routes use many hops, or when ',...
+         'contention is high.\n'],snrFailThreshold_dB);
 fprintf(['Links with SNR below %.1f dB are excluded ',...
          'from routing; nodes remain physically active.\n'],...
          snrFailThreshold_dB);
 fprintf("==========================================\n");
+
+%% Save all results
+
+folderName = sprintf('%s_N%d_TX%d_TH%d',char(radioMode),N,Tx_dBm,snrFailThreshold_dB);
+resultsFolder = fullfile('C:\Users\morsa\OneDrive\שולחן העבודה\Simulation Results',folderName);
+
+if ~exist(resultsFolder,'dir')
+    mkdir(resultsFolder);
+end
+
+%% Save all figures
+figs = findall(groot,'Type','figure');
+
+for k = 1:length(figs)
+    exportgraphics(figs(k),...
+        fullfile(resultsFolder,sprintf('Figure_%d.png',k)),...
+        'Resolution',300);
+end
+
+%% Save workspace
+save(fullfile(resultsFolder,'SimulationResults.mat'));
+
+Summary = table(...
+    {char(radioMode)},...
+    N,...
+    Tx_dBm,...
+    snrFailThreshold_dB,...
+    mean(selectedThr,'omitnan'),...
+    mean(selectedLat,'omitnan'),...
+    mean(selectedPDR,'omitnan'),...
+    mean(selectedSNR,'omitnan'),...
+    mean(bestVal(:,5),'omitnan'),...
+    'VariableNames',{'Technology',...
+                     'N',...
+                     'Tx_dBm',...
+                     'Threshold_dB',...
+                     'Throughput_Mbps',...
+                     'Latency_us',...
+                     'PDR',...
+                     'BottleneckSNR_dB',...
+                     'Capacity_Mbps'});
+excelFile = fullfile('C:\Users\morsa\OneDrive\שולחן העבודה\Simulation Results',...
+                     'AllResults.xlsx');
+if ~isfile(excelFile)
+
+    writetable(Summary,excelFile);
+
+else
+
+    oldTable = readtable(excelFile);
+
+    newTable = [oldTable; Summary];
+
+    writetable(newTable,excelFile);
+
+end
 
 end % function
 
@@ -974,9 +776,15 @@ end % function
 %% =========================================================================
 
 function [B_Hz,f_Hz,Tx_dBm,NF_dB,rxSensitivity_dBm,phyDataRate_bps,perHopAirtime_s,dutyCycle] = ...
-    configureRadioMode(radioMode,loraSF,loraBW_Hz,loraCR,loraPreamble,dutyCycle)
+    configureRadioMode(radioMode,loraSF,loraBW_Hz,loraCR,loraPreamble,packet_B, ...
+    loraDutyCycleLimit,wifiDutyCycleLimit,bleDutyCycleLimit,customDutyCycleLimit)
 % Configure the simulation according to the selected radio on the board.
-packet_B_default = 127;
+% NOTE (duty-cycle fix): each mode now returns its OWN duty-cycle limit
+% instead of silently overwriting whatever was passed in with 1.0. LoRa
+% enforces the regulatory sub-band limit; Wi-Fi/BLE Mesh/Custom are not
+% duty-cycle-regulated the same way, so they default to 1.0 (no additional
+% throughput derating beyond what macEff / contention already capture) but
+% are still fully configurable via the top-level parameters.
 NF_dB = 6;
 switch radioMode
     case "LoRa"
@@ -994,31 +802,32 @@ switch radioMode
             error('Unsupported LoRa spreading factor');
     end
         phyDataRate_bps = loraBitrate(loraSF,loraBW_Hz,loraCR);
-        perHopAirtime_s = loraTimeOnAir(packet_B_default,loraSF,loraBW_Hz,loraCR,loraPreamble);
+        perHopAirtime_s = loraTimeOnAir(packet_B,loraSF,loraBW_Hz,loraCR,loraPreamble);
+        dutyCycle = loraDutyCycleLimit;
     case "WiFi"
         B_Hz = 20e6;
         f_Hz = 2.4e9;
         Tx_dBm = 18;
         rxSensitivity_dBm = -90;
         phyDataRate_bps = 150e6;
-        perHopAirtime_s = (packet_B_default*8)/phyDataRate_bps + 300e-6;
-        dutyCycle = 1.0;
+        perHopAirtime_s = (packet_B*8)/phyDataRate_bps + 300e-6;
+        dutyCycle = wifiDutyCycleLimit;
     case "BLEMesh"
         B_Hz = 2e6;
         f_Hz = 2.4e9;
         Tx_dBm = 8;
         rxSensitivity_dBm = -96;
         phyDataRate_bps = 1e6;
-        perHopAirtime_s = (packet_B_default*8)/phyDataRate_bps + 2e-3;
-        dutyCycle = 1.0;
+        perHopAirtime_s = (packet_B*8)/phyDataRate_bps + 2e-3;
+        dutyCycle = bleDutyCycleLimit;
     case "Custom"
         B_Hz = 4e6;
         f_Hz = 915e6;
         Tx_dBm = 0;
         rxSensitivity_dBm = -105;
         phyDataRate_bps = 4e6;
-        perHopAirtime_s = (packet_B_default*8)/phyDataRate_bps + 0.5e-3;
-        dutyCycle = 1.0;
+        perHopAirtime_s = (packet_B*8)/phyDataRate_bps + 0.5e-3;
+        dutyCycle = customDutyCycleLimit;
     otherwise
         error('Unknown radioMode.');
 end
@@ -1056,7 +865,7 @@ end
 
 
 
-function [A,link] = buildLoRaRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB,f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB)
+function [A,link] = buildRadioGraph(pos,alive,B_Hz,Tx_dBm,NF_dB,f_Hz,rxSensitivity_dBm,phyDataRate_bps,extraLoss_dB,shadowStd_dB,pathLossExponent)
 % Build graph using the selected radio link budget.
 % A link exists if received power is above the receiver sensitivity.
 N=size(pos,1);
@@ -1080,7 +889,7 @@ for i = 1:N
         d = max(hypot(pos(i,1)-pos(j,1),pos(i,2)-pos(j,2)),0.1); %distance between Nodes i,j
 
         % One received-power realization per link and time step
-        rx = calcRxPowerLoRa(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB); %final received power
+        rx = calcRxPower(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB,pathLossExponent); %final received power
         %snr calculations in db and linear
         sdb  = rx - noise_dBm; 
         slin = 10^(sdb/10);
@@ -1118,23 +927,30 @@ link.rxSensitivity_dBm = rxSensitivity_dBm;
 end
 
 
-function rx_dBm = calcRxPowerLoRa(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB)
-% Log-distance path loss model. PL exponent 2.7 is an indoor/urban assumption.
-PL_exp=4; 
-PL0_dB=20*log10(4*pi*1/3e8*f_Hz); %reference path loss at 1 meter.
-fastFade =  0.8*randn;
-shadow = shadowStd_dB*randn; %shadowing component.Uses a normal random distribution.Simulates signal blocking by moving obstacles or buildings
-pl=PL0_dB+10*PL_exp*log10(d)+extraLoss_dB+shadow; %Total path loss calculation.Combines distance loss, extra static losses, and random fading.
-rx_dBm=Tx_dBm-pl+ fastFade; %final recived power.
+function rx_dBm = calcRxPower(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB,pathLossExponent)
+% Log-distance path-loss model.
+% pathLossExponent is defined by the selected environment.
+% Prevent log10(0) and keep the model referenced to 1 meter.
+d = max(d,1);
+PL0_dB = 20*log10(4*pi*f_Hz/3e8); %Free-space path loss at the reference path loss at 1 meter.
+fastFade_dB = 0.8*randn; % Small-scale fading.
+% Large-scale shadowing caused by buildings, terrain, vehicles, etc.
+shadow_dB = shadowStd_dB*randn;
+% Total path loss.
+pathLoss_dB=PL0_dB+10*pathLossExponent*log10(d)+extraLoss_dB+shadow_dB;
+% Received power.
+rx_dBm = Tx_dBm - pathLoss_dB + fastFade_dB;
 end
 
-function R = estimateLoRaRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB)
+function R = estimateRadioRange(Tx_dBm,rxSensitivity_dBm,f_Hz,extraLoss_dB,pathLossExponent)
 % Approximate max range using sensitivity and no random shadowing.
-PL_exp=2.7;
-PL0_dB=20*log10(4*pi*1/3e8*f_Hz);
-maxPL = Tx_dBm - rxSensitivity_dBm - extraLoss_dB;
-R = 10^((maxPL-PL0_dB)/(10*PL_exp));
+PL0_dB = 20*log10(4*pi*f_Hz/3e8); % Free-space path loss at 1 meter.
+% Maximum allowable propagation loss.
+maxPathLoss_dB = Tx_dBm - rxSensitivity_dBm -extraLoss_dB;
+% Solve the log-distance model for distance.
+R = 10^((maxPathLoss_dB - PL0_dB) / (10*pathLossExponent));
 end
+
 
 function pc=allSimplePaths(A,src,dst,maxH,maxE)
 N=size(A,1); vis=false(1,N);
@@ -1154,11 +970,12 @@ dfs(src);
     end
 end
 
-function results=pathMetrics(pc,link,B_Hz,macEff,pktB,pos,perHopAirtime_s,dutyCycle, radioMode,loraSF)
+function results = pathMetrics(pc,link,B_Hz,macEff,pktB,pos,...
+    perHopAirtime_s,dutyCycle,radioMode,loraSF,routingThreshold_dB)
 % Path metrics for the selected radio mode.
 % Throughput is based on bottleneck PHY capacity, duty cycle, MAC efficiency and route-level PDR.
-% PDR can be < 1 because every hop may loשלנאse packets due to weak SNR,
-% longer hop distance, multi-hop accumulation, and local contention.
+% PDR can be below 1 because each hop may lose packets due to
+% weak SNR, multi-hop accumulation, and local contention.
 np=numel(pc); c=3e8;
 rt=strings(np,1); hp=zeros(np,1);
 thr=zeros(np,1); lat=zeros(np,1);
@@ -1197,22 +1014,21 @@ for k=1:np
         snrDB = hS(i);
         % At 8 dB, packet success is 50%.
         % At 10 dB, packet success is approximately 67%.
-        if radioMode == "LoRa"
+        
+       if radioMode == "LoRa"
 
-            switch loraSF
-                case 7
-                    snrMid_dB = -5.5;
-                case 10
-                    snrMid_dB = -8;
-                case 12
-                    snrMid_dB = -12;
-            end
+            % The 50% packet-success point is placed slightly above
+            % the routing threshold.
+            snrMid_dB = routingThreshold_dB - 2;
 
-            snrSlope = 0.5;
-
+            % Controls how quickly PDR rises with SNR.
+            snrSlope = 1.0;
         else
-            snrMid_dB = 8;
-            snrSlope = 0.35;
+
+            % For Wi-Fi, BLE Mesh, and Custom radio modes.
+            snrMid_dB = routingThreshold_dB - 2;
+            snrSlope = 1.0;
+
         end
         
         % PDR caused only by the physical SNR
@@ -1227,7 +1043,7 @@ for k=1:np
         % assumes the channel can handle up to 15 neighboring nodes before collisions become an issue.
         %For every neighbor above 15, a 0.02% penalty is deducted
         nodeDegree = sum(link.A(u,:));
-        degreePenalty = 0.0002*max(0,nodeDegree-15);
+        degreePenalty = 0.0002*max(0,nodeDegree-20);
         
         % Final per-hop PDR used by the simulation
         hP(i)=max(0.001, min(0.9999, hopSucc - degreePenalty));
@@ -1236,8 +1052,12 @@ for k=1:np
         sampleSNR(end+1,1)        = snrDB;
         sampleSNRonlyPDR(end+1,1) = hopSucc;
         sampleFinalPDR(end+1,1)   = hP(i);
+
     end
-    bc=min(hC); bCap(k)=bc/1e6;
+    % Bottleneck capacity of the route:
+    % the minimum Shannon capacity among all route links
+    bc=min(hC); bCap(k)=bc/1e6; 
+    % Bottleneck SNR of the route
     bSNR(k)=min(hS);
 
     % Route-level PDR is the mult product of hop success probabilities.
@@ -1246,10 +1066,19 @@ for k=1:np
     pdr(k)=prod(hP);
 
     % Optional retransmission effect: lower PDR increases expected latency.
-    expectedRetries = 1/max(pdr(k),0.05);
-    lat(k)=sum(hL)*1e6*expectedRetries;
-    thr(k)=(dutyCycle*macEff*bc*pdr(k))/1e6;  % effective goodput includes duty cycle and delivery success
-    rt(k)=strjoin("N"+string(p),"->"); 
+    maxRetries = 3;
+    expectedAttempts = min(1 ./ max(hP,0.05),maxRetries + 1);
+    routeServiceTime_s = sum(hL .* expectedAttempts);
+    lat(k) = routeServiceTime_s * 1e6;
+    % Effective route throughput based on Shannon bottleneck capacity
+    thr(k) = dutyCycle * macEff * bc * pdr(k) / 1e6;
+    % Route string
+    rt(k) = strjoin("N"+string(p),"->");
+    % Effective route throughput based on goodput modal - DELETED
+    %payloadBits = pktB * 8;
+    %routeGoodput_bps = payloadBits/ routeServiceTime_s;
+    %thr(k) = dutyCycle * macEff * routeGoodput_bps / 1e6; % effective goodput includes duty cycle and delivery success
+    %rt(k)=strjoin("N"+string(p),"->"); 
 end
 T2=table(rt,hp,thr,lat,bSNR,pdr,bCap,...
     'VariableNames',["Route","Hops","Throughput_Mbps","Latency_us",...
@@ -1259,3 +1088,4 @@ results.linkSNR        = sampleSNR;
 results.snrOnlyHopPDR  = sampleSNRonlyPDR;
 results.finalHopPDR    = sampleFinalPDR;
 end
+
