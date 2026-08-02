@@ -29,7 +29,7 @@ N   = 50;   src = 1;   dst = N;
 areaW = 30;  areaH = 200;      % 30 x 200 m tactical corridor area
 % Mobility
 dt   = 0.5;  T  = 60;    % 0.5-second step, total simulation time = 30 seconds
-vMin = 0.3;   vMax = 1.5;     % m/s
+vMin = 0.5;   vMax = 2;     % m/s
 ```
 
 Each simulation step:
@@ -373,101 +373,6 @@ dfs(src);
 end
 ```
 
-## SNR Threshold Analysis
-The simulator evaluates network performance for several routing thresholds.
-
-For each threshold it computes:
-- Mean PDR
-- Mean Throughput
-- Mean Latency
-- Number of active links
-- Route availability
-This allows studying the trade-off between: 
-- aggressive routing
-- conservative routing
-- network connectivity
-- communication reliability
-
-```matlab
-%% Test network performance for different SNR thresholds
-
-for s = 1:numThresholds
-
-    currentThreshold_dB = thresholdVec(s);
-
-    % Keep only physical links whose SNR meets this threshold
-    A_threshold = A_all & ...
-        (link_all.snr_dB >= currentThreshold_dB);
-
-    % Make sure the adjacency matrix is symmetric
-    A_threshold = double(A_threshold & A_threshold');
-
-    % Count unique active links
-    thresholdActiveLinks(t,s) = ...
-        nnz(triu(A_threshold));
-
-    % Create link structure for this threshold
-    link_threshold = link_all;
-    link_threshold.A = A_threshold;
-
-    % Remove the metrics of excluded links
-    excludedLinks = (A_threshold == 0);
-
-    link_threshold.snr_dB(excludedLinks)  = NaN;
-    link_threshold.snrLin(excludedLinks)  = NaN;
-    link_threshold.cap_bps(excludedLinks) = NaN;
-    link_threshold.rx_dBm(excludedLinks)  = NaN;
-
-    % Create graph for this threshold
-    G_threshold = graph(A_threshold);
-
-    % Check whether SRC and DST are connected
-    componentID = conncomp(G_threshold);
-
-    thresholdReachable = ...
-        (componentID(src) == componentID(dst));
-
-    if thresholdReachable
-
-        % Find candidate routes
-        thresholdPaths = allSimplePaths(...
-            A_threshold,...
-            src,...
-            dst,...
-            maxHops,...
-            maxEnumPaths);
-
-        if ~isempty(thresholdPaths)
-
-            thresholdResults = pathMetrics(thresholdPaths,...
-                link_threshold,B_Hz,macEff,packet_B,pos,...
-                perHopAirtime_s,dutyCycle,radioMode,loraSF,currentThreshold_dB);
-
-            thresholdTable = thresholdResults.table;
-
-            % Select the route with maximum throughput
-            [~,thresholdRouteIndex] = ...
-                max(thresholdTable.Throughput_Mbps);
-
-            % Store the selected-route metrics
-            thresholdSelectedPDR(t,s) = ...
-                thresholdTable.PDR(thresholdRouteIndex);
-
-            thresholdSelectedThr(t,s) = ...
-                thresholdTable.Throughput_Mbps(...
-                thresholdRouteIndex);
-
-            thresholdSelectedLat(t,s) = ...
-                thresholdTable.Latency_us(...
-                thresholdRouteIndex);
-
-            thresholdRouteExists(t,s) = true;
-        end
-    end
-end
-
-```
-
 ## Visualization
 The simulator generates several figures.
 ### Figure 1- Live network topology  
@@ -555,19 +460,20 @@ for k=1:np
         snrDB = hS(i);
         % At 8 dB, packet success is 50%.
         % At 10 dB, packet success is approximately 67%.
-        if radioMode == "LoRa"
+        
+       if radioMode == "LoRa"
 
             % The 50% packet-success point is placed slightly above
             % the routing threshold.
-            snrMid_dB = routingThreshold_dB + 1;
+            snrMid_dB = routingThreshold_dB - 2;
 
             % Controls how quickly PDR rises with SNR.
-            snrSlope = 0.8;
+            snrSlope = 1.0;
         else
 
             % For Wi-Fi, BLE Mesh, and Custom radio modes.
-            snrMid_dB = routingThreshold_dB + 2;
-            snrSlope = 0.5;
+            snrMid_dB = routingThreshold_dB - 2;
+            snrSlope = 1.0;
 
         end
         
@@ -583,7 +489,7 @@ for k=1:np
         % assumes the channel can handle up to 15 neighboring nodes before collisions become an issue.
         %For every neighbor above 15, a 0.02% penalty is deducted
         nodeDegree = sum(link.A(u,:));
-        degreePenalty = 0.0002*max(0,nodeDegree-15);
+        degreePenalty = 0.0002*max(0,nodeDegree-20);
         
         % Final per-hop PDR used by the simulation
         hP(i)=max(0.001, min(0.9999, hopSucc - degreePenalty));
@@ -594,7 +500,10 @@ for k=1:np
         sampleFinalPDR(end+1,1)   = hP(i);
 
     end
-    bc=min(hC); bCap(k)=bc/1e6;
+    % Bottleneck capacity of the route:
+    % the minimum Shannon capacity among all route links
+    bc=min(hC); bCap(k)=bc/1e6; 
+    % Bottleneck SNR of the route
     bSNR(k)=min(hS);
 
     % Route-level PDR is the mult product of hop success probabilities.
@@ -607,10 +516,15 @@ for k=1:np
     expectedAttempts = min(1 ./ max(hP,0.05),maxRetries + 1);
     routeServiceTime_s = sum(hL .* expectedAttempts);
     lat(k) = routeServiceTime_s * 1e6;
-    payloadBits = pktB * 8;
-    routeGoodput_bps = payloadBits/ routeServiceTime_s;
-    thr(k) = dutyCycle * macEff * routeGoodput_bps / 1e6; % effective goodput includes duty cycle and delivery success
-    rt(k)=strjoin("N"+string(p),"->"); 
+    % Effective route throughput based on Shannon bottleneck capacity
+    thr(k) = dutyCycle * macEff * bc * pdr(k) / 1e6;
+    % Route string
+    rt(k) = strjoin("N"+string(p),"->");
+    % Effective route throughput based on goodput modal - DELETED
+    %payloadBits = pktB * 8;
+    %routeGoodput_bps = payloadBits/ routeServiceTime_s;
+    %thr(k) = dutyCycle * macEff * routeGoodput_bps / 1e6; % effective goodput includes duty cycle and delivery success
+    %rt(k)=strjoin("N"+string(p),"->"); 
 end
 T2=table(rt,hp,thr,lat,bSNR,pdr,bCap,...
     'VariableNames',["Route","Hops","Throughput_Mbps","Latency_us",...
