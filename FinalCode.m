@@ -48,7 +48,7 @@ vMin = 0.5;   vMax = 2;     % m/s
 %   1) LoRa SX1262: 470-510 MHz / 863-928 MHz, Tx up to 21 dBm, sensitivity down to -139 dBm
 %   2) Wi-Fi 802.11 b/g/n: up to 150 Mbps, short-range high-rate mode
 %   3) Bluetooth LE / Bluetooth Mesh: low-rate short-range mesh mode
-radioMode = "LoRa";          % choose: "Custom" , "LoRa", "WiFi", or "BLEMesh"
+radioMode = "Custom";          % choose: "Custom" , "LoRa", "WiFi", or "BLEMesh"
 
 % LoRa scenario parameters. These are used only when radioMode = "LoRa".
 loraSF = 7;                   % choose 7, 10, or 12 to show range/latency tradeoff
@@ -63,7 +63,7 @@ loraPreamble = 8;             % LoRa preamble symbols
 % region / band plan. FCC 915 MHz operation instead uses dwell-time + hop
 % rules rather than a duty-cycle percentage; treat loraDutyCycleLimit as an
 % effective cap either way.
-loraDutyCycleLimit   = 1.0;  % 
+loraDutyCycleLimit   = 1.0;  % NOT REALISTIC,MOSTLY A LOT LESS
 wifiDutyCycleLimit   = 1.0;   % no regulatory duty-cycle limit; contention handled via macEff instead
 bleDutyCycleLimit    = 1.0;   % no regulatory duty-cycle limit; advertising duty cycle not modeled here
 customDutyCycleLimit = 1.0;   % user-configurable radio: set your own limit here
@@ -98,8 +98,9 @@ end
 thresholdLabel = sprintf('%.1f dB threshold',snrFailThreshold_dB);
 
 % MAC
-packet_B = 127; % bytes
-macEff   = 0.70; % MAC efficiency / duty-cycle / overhead factor
+packet_B = 127; % packet size in bytes
+macEff   = 0.70; % MAC efficiency. we assume that the usful infornation 
+% transmission time is only 70% of the total channel occupation time. 
 
 % Configure radio parameters according to selected mode
 [B_Hz,f_Hz,Tx_dBm,NF_dB,rxSensitivity_dBm,phyDataRate_bps,perHopAirtime_s,dutyCycle] = ...
@@ -107,25 +108,37 @@ macEff   = 0.70; % MAC efficiency / duty-cycle / overhead factor
     loraDutyCycleLimit,wifiDutyCycleLimit,bleDutyCycleLimit,customDutyCycleLimit);
 
 % Scenario control
-% "NORMAL": chip-spec 20x20m network, usually very strong SNR.
-% "SNR_FAILURE_DEMO": adds obstacle/body/urban loss so some nodes fail
+% "OPEN": open area or with few obstacle/body/urban
+% "URBAN": adds obstacle/body/urban loss so some links fail
+% "HARSH": extreme scenario with obstacle loss so a lot of links fail
 % only when their strongest SNR is below 10 dB (changable).
 % for pathLossExponent: 2.0–2.5: open outdoor environment, 
 % 2.5–3.0: suburban or partly obstructed,
 % 3.0–4.0: urban, indoor, or heavily obstructed.
-scenario = "NORMAL";
+% Extra Loss=constant attenuation value applied to all links within a given scenario.
+% added to path loss. reduces recived power,snr,less links,smaller pdr and
+% throughput for the whole netwotk.
+% Shadow loss= random variations in received signal strength for every
+% link,even if in the same distance. causes changes in snr and pdr,routing
+% changes,lass stability. 
+scenario = "URBAN";
 
 switch scenario
 
-    case "NORMAL"
+    case "OPEN"
+        extraLoss_dB = 7;
+        shadowStd_dB = 3;
+        pathLossExponent = 2.7; 
+
+    case "URBAN"
         extraLoss_dB = 15;
         shadowStd_dB = 4;
         pathLossExponent = 3.2; 
 
-    case "SNR_FAILURE_DEMO"
-        extraLoss_dB = 10;
-        shadowStd_dB = 4;
-        pathLossExponent = 4; 
+    case "HARSH"
+        extraLoss_dB = 25;
+        shadowStd_dB = 8;
+        pathLossExponent = 3.7;
 
     otherwise
         extraLoss_dB = 0;
@@ -133,20 +146,17 @@ switch scenario
         pathLossExponent = 2.7; 
 end
 
-
 % Path search restrictions
-maxEnumPaths = 100;
-maxHops      = 7;
+maxEnumPaths = 100; %max pathes to search
+maxHops      = 7; %max num of hops in a path
 
+%% VISUALIZATION
 % Trail length for animated topology
 trailLen = 6;
-
 % Snapshots for montage
 numSnapshots = 10;
 snapSteps    = round(linspace(1, T, numSnapshots));
 plotEvery = 1;
-
-
 %% ==================== INITIALISE =======================================
 pos   = [areaW*rand(N,1), areaH*rand(N,1)];
 wp    = [areaW*rand(N,1), areaH*rand(N,1)];
@@ -780,28 +790,30 @@ function [B_Hz,f_Hz,Tx_dBm,NF_dB,rxSensitivity_dBm,phyDataRate_bps,perHopAirtime
     loraDutyCycleLimit,wifiDutyCycleLimit,bleDutyCycleLimit,customDutyCycleLimit)
 % Configure the simulation according to the selected radio on the board.
 % NOTE (duty-cycle fix): each mode now returns its OWN duty-cycle limit
-% instead of silently overwriting whatever was passed in with 1.0. LoRa
-% enforces the regulatory sub-band limit; Wi-Fi/BLE Mesh/Custom are not
+% instead of silently overwriting whatever was passed in with 1.0. 
+% LoRa enforces the regulatory sub-band limit; Wi-Fi/BLE Mesh/Custom are not
 % duty-cycle-regulated the same way, so they default to 1.0 (no additional
 % throughput derating beyond what macEff / contention already capture) but
 % are still fully configurable via the top-level parameters.
-NF_dB = 6;
+NF_dB = 6; % noise that the reciver adds
 switch radioMode
     case "LoRa"
         B_Hz = loraBW_Hz;
         f_Hz = 915e6;
-        Tx_dBm = 10; 
+        Tx_dBm = 10; %tx power from transmitter
+    %lora uses Chirp Spread Spectrum (CSS) technology so it can identify 
+    % a signal with negative SNR = good sensativity= can handle weak signal
     switch loraSF
         case 7
-            rxSensitivity_dBm = -124;
+            rxSensitivity_dBm = -124; 
         case 10
             rxSensitivity_dBm = -133;
         case 12
             rxSensitivity_dBm = -137;
         otherwise
             error('Unsupported LoRa spreading factor');
-    end
-        phyDataRate_bps = loraBitrate(loraSF,loraBW_Hz,loraCR);
+    end 
+        phyDataRate_bps = loraBitrate(loraSF,loraBW_Hz,loraCR); 
         perHopAirtime_s = loraTimeOnAir(packet_B,loraSF,loraBW_Hz,loraCR,loraPreamble);
         dutyCycle = loraDutyCycleLimit;
     case "WiFi"
@@ -823,9 +835,9 @@ switch radioMode
     case "Custom"
         B_Hz = 4e6;
         f_Hz = 915e6;
-        Tx_dBm = 0;
-        rxSensitivity_dBm = -105;
-        phyDataRate_bps = 4e6;
+        Tx_dBm = 10;
+        rxSensitivity_dBm = -105; %if rx_dBm<rxSensitivity_dBm link fails
+        phyDataRate_bps = 4e6;  %phsical data rate limit that can be transmitted by the technology
         perHopAirtime_s = (packet_B*8)/phyDataRate_bps + 0.5e-3;
         dutyCycle = customDutyCycleLimit;
     otherwise
@@ -874,7 +886,7 @@ rx_dBm  = nan(N);
 snr_dB  = nan(N);
 snrLin  = nan(N);
 cap_bps = nan(N);
-noise_dBm = -174 + 10*log10(B_Hz) + NF_dB; %receiver's noise baseline
+noise_dBm = -174 + 10*log10(B_Hz) + NF_dB; % overall total noise
 
 for i = 1:N
     if ~alive(i)
@@ -891,11 +903,11 @@ for i = 1:N
         % One received-power realization per link and time step
         rx = calcRxPower(d,Tx_dBm,f_Hz,extraLoss_dB,shadowStd_dB,pathLossExponent); %final received power
         %snr calculations in db and linear
-        sdb  = rx - noise_dBm; 
+        sdb  = rx - noise_dBm; % snr in dBm
         slin = 10^(sdb/10);
 
-        shannonCap = B_Hz*log2(1+slin); %bits per sec
-        cap = min(shannonCap,phyDataRate_bps); %data-rate limitation
+        shannonCap = B_Hz*log2(1+slin); % theoretic max cap, in bits per sec
+        cap = min(shannonCap,phyDataRate_bps); %data-rate limitation,max cap of that can be trans
 
         rx_dBm(i,j) = rx;
         rx_dBm(j,i) = rx;
@@ -976,7 +988,8 @@ function results = pathMetrics(pc,link,B_Hz,macEff,pktB,pos,...
 % Throughput is based on bottleneck PHY capacity, duty cycle, MAC efficiency and route-level PDR.
 % PDR can be below 1 because each hop may lose packets due to
 % weak SNR, multi-hop accumulation, and local contention.
-np=numel(pc); c=3e8;
+np=numel(pc); %number of paths
+c=3e8;
 rt=strings(np,1); hp=zeros(np,1);
 thr=zeros(np,1); lat=zeros(np,1);
 bSNR=zeros(np,1); pdr=zeros(np,1); bCap=zeros(np,1);
@@ -984,36 +997,35 @@ sampleSNR = [];
 sampleSNRonlyPDR = [];
 sampleFinalPDR   = [];
 for k=1:np
-    p=pc{k}; H=numel(p)-1; hp(k)=H;
-    hC=zeros(H,1); hS=zeros(H,1); hP=zeros(H,1); hL=zeros(H,1);
+    p=pc{k}; %path k
+    H=numel(p)-1; hp(k)=H; %number of hops in path k
+    hC=zeros(H,1); hS=zeros(H,1); hP=zeros(H,1); hL=zeros(H,1); %cap,snr,pdr,latency of each hop in path k
     for i=1:H
         u=p(i); v=p(i+1);
-        d=max(hypot(pos(u,1)-pos(v,1),pos(u,2)-pos(v,2)),0.1);
+        d=max(hypot(pos(u,1)-pos(v,1),pos(u,2)-pos(v,2)),0.1); %distance between 2 nodes in path 
 
         % Realistic per-hop delay. For LoRa this is packet Time-on-Air;
         % for Wi-Fi/BLE this is a small packet-airtime/processing delay.
-        propDelay_s = d / c;   % propagation delay
+        propDelay_s = d / c;   % propagation delay=distance/c
         if radioMode == "LoRa"
-            txDelay_s = perHopAirtime_s;
+            txDelay_s = perHopAirtime_s; %tansmission delay
         else
-            txDelay_s = (pktB*8) / link.cap_bps(u,v);
+            txDelay_s = (pktB*8) / link.cap_bps(u,v); %tansmission delay=num of bits in packet (127*8)/cap data rate of link
         end
         procDelay_s = 0.5e-3;  % fixed 0.5 ms processing delay per hop
         nodeDegree = sum(link.A(u,:));
         queueDelay_s = 0.1e-3 * max(0,nodeDegree-5); % congestion delay. No queueing penalty up to 5 neighboring nodes. Every additional neighbor adds 0.1 ms of queueing delay.
 
-        hL(i) = propDelay_s + txDelay_s + procDelay_s + queueDelay_s; %hop latency
+        hL(i) = propDelay_s + txDelay_s + procDelay_s + queueDelay_s; %latency of hop i in path k
 
         % Capacity and SNR are physics-based.
-        hC(i)=link.cap_bps(u,v); 
-        hS(i)=link.snr_dB(u,v);
+        hC(i)=link.cap_bps(u,v); %cap of hop i in path k
+        hS(i)=link.snr_dB(u,v); %snr of hop i in path k
 
         % Packet-success model that allows PDR < 1.
         % Links with SNR below the routing threshold are excluded.
         % Links close to the threshold may still experience packet errors.
         snrDB = hS(i);
-        % At 8 dB, packet success is 50%.
-        % At 10 dB, packet success is approximately 67%.
         
        if radioMode == "LoRa"
 
@@ -1043,10 +1055,10 @@ for k=1:np
         % assumes the channel can handle up to 15 neighboring nodes before collisions become an issue.
         %For every neighbor above 15, a 0.02% penalty is deducted
         nodeDegree = sum(link.A(u,:));
-        degreePenalty = 0.0002*max(0,nodeDegree-20);
+        degreePenalty = 0.0002*max(0,nodeDegree-15);
         
         % Final per-hop PDR used by the simulation
-        hP(i)=max(0.001, min(0.9999, hopSucc - degreePenalty));
+        hP(i)=max(0.001, min(0.9999, hopSucc - degreePenalty)); %pdr of hop i in path k
 
         % Save samples for post-run analysis
         sampleSNR(end+1,1)        = snrDB;
@@ -1054,24 +1066,23 @@ for k=1:np
         sampleFinalPDR(end+1,1)   = hP(i);
 
     end
-    % Bottleneck capacity of the route:
-    % the minimum Shannon capacity among all route links
-    bc=min(hC); bCap(k)=bc/1e6; 
+    % Bottleneck capacity of the route: the min Shannon cap among all route links
+    bc=min(hC); 
+    bCap(k)=bc/1e6; % Bottleneck capacity of path k
     % Bottleneck SNR of the route
-    bSNR(k)=min(hS);
+    bSNR(k)=min(hS); % Bottleneck SNR of path k
 
     % Route-level PDR is the mult product of hop success probabilities.
-    % This naturally creates scenarios with PDR < 1, especially for weak or
-    % multi-hop routes.
-    pdr(k)=prod(hP);
+    % for multi-hop routes.
+    pdr(k)=prod(hP); % PDR of path k as sum of hop's pdr
 
     % Optional retransmission effect: lower PDR increases expected latency.
-    maxRetries = 3;
-    expectedAttempts = min(1 ./ max(hP,0.05),maxRetries + 1);
-    routeServiceTime_s = sum(hL .* expectedAttempts);
-    lat(k) = routeServiceTime_s * 1e6;
+    maxRetries = 3; %max retries to resend packet (4 tries overall)
+    expectedAttempts = min(1 ./ max(hP,0.05),maxRetries + 1); %everage num of tries to sucsses
+    routeServiceTime_s = sum(hL .* expectedAttempts); %overall time of service for path k
+    lat(k) = routeServiceTime_s * 1e6; % Latency of path k
     % Effective route throughput based on Shannon bottleneck capacity
-    thr(k) = dutyCycle * macEff * bc * pdr(k) / 1e6;
+    thr(k) = dutyCycle * macEff * bc * pdr(k) / 1e6; % Throughput of path k
     % Route string
     rt(k) = strjoin("N"+string(p),"->");
     % Effective route throughput based on goodput modal - DELETED
